@@ -218,22 +218,30 @@ def create_windows_junction(source: Path, target: Path) -> None:
         raise OSError(f"Failed to create junction: {detail}")
 
 
-def create_directory_link(source: Path, target: Path) -> str:
+def create_directory_symlink(source: Path, target: Path) -> None:
     try:
         target.symlink_to(source, target_is_directory=True)
-        return "symlink"
     except OSError as exc:
-        if not is_windows():
-            raise OSError(f"Failed to create symlink: {exc}") from exc
+        raise OSError(f"Failed to create symlink: {exc}") from exc
 
+
+def create_directory_link(source: Path, target: Path) -> str:
+    if is_windows():
         try:
             create_windows_junction(source, target)
+            return "junction"
         except OSError as fallback_exc:
-            raise OSError(
-                f"Failed to create symlink ({exc}); fallback junction also failed ({fallback_exc})"
-            ) from fallback_exc
+            try:
+                create_directory_symlink(source, target)
+                return "symlink"
+            except OSError as exc:
+                raise OSError(
+                    f"Failed to create junction ({fallback_exc}); fallback symlink also failed ({exc})"
+                ) from fallback_exc
 
-        return "junction"
+    create_directory_symlink(source, target)
+    return "symlink"
+
 
 
 def ensure_directory(path: Path) -> None:

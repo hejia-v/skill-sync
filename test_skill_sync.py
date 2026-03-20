@@ -102,5 +102,41 @@ class SkillSyncMainTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
 
+class CreateDirectoryLinkTests(unittest.TestCase):
+    def test_windows_prefers_junction_before_symlink(self) -> None:
+        source = Path(r"C:\skills\foo")
+        target = Path(r"C:\project\.codex\skills\foo")
+
+        with (
+            patch.object(SKILL_SYNC, "is_windows", return_value=True),
+            patch.object(SKILL_SYNC, "create_windows_junction") as junction_mock,
+            patch.object(SKILL_SYNC, "create_directory_symlink") as symlink_mock,
+        ):
+            link_type = SKILL_SYNC.create_directory_link(source, target)
+
+        self.assertEqual(link_type, "junction")
+        junction_mock.assert_called_once_with(source, target)
+        symlink_mock.assert_not_called()
+
+    def test_windows_falls_back_to_symlink_when_junction_fails(self) -> None:
+        source = Path(r"C:\skills\foo")
+        target = Path(r"C:\project\.codex\skills\foo")
+
+        with (
+            patch.object(SKILL_SYNC, "is_windows", return_value=True),
+            patch.object(
+                SKILL_SYNC,
+                "create_windows_junction",
+                side_effect=OSError("junction failed"),
+            ) as junction_mock,
+            patch.object(SKILL_SYNC, "create_directory_symlink") as symlink_mock,
+        ):
+            link_type = SKILL_SYNC.create_directory_link(source, target)
+
+        self.assertEqual(link_type, "symlink")
+        junction_mock.assert_called_once_with(source, target)
+        symlink_mock.assert_called_once_with(source, target)
+
+
 if __name__ == "__main__":
     unittest.main()
