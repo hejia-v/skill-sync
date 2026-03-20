@@ -128,6 +128,13 @@ class SyncStats:
             self.results = []
 
 
+@dataclass
+class RuntimeContext:
+    mode: str
+    sync_root: Path
+    config_path: Path
+
+
 def load_config(config_path: Path) -> dict[str, list[str]]:
     if not config_path.is_file():
         raise ValueError(f"Config file not found: {config_path}")
@@ -275,9 +282,9 @@ def add_result(
     )
 
 
-def sync_agent_skills(agent: str, skills: list[str], skill_home: Path, home: Path) -> SyncStats:
+def sync_agent_skills(agent: str, skills: list[str], skill_home: Path, sync_root: Path) -> SyncStats:
     stats = SyncStats(agent=agent)
-    target_skills_dir = home / f".{agent}" / "skills"
+    target_skills_dir = sync_root / f".{agent}" / "skills"
 
     try:
         ensure_directory(target_skills_dir)
@@ -333,6 +340,26 @@ def sync_agent_skills(agent: str, skills: list[str], skill_home: Path, home: Pat
         add_result(stats, skill_name, source_dir, target_path, "OK", reason, False)
 
     return stats
+
+
+def resolve_runtime_context(argv: list[str]) -> RuntimeContext:
+    if len(argv) > 2:
+        raise ValueError("Usage: skill-sync.py [PATH]")
+
+    if len(argv) == 1:
+        sync_root = Path.home()
+        return RuntimeContext(mode="global", sync_root=sync_root, config_path=sync_root / ".mskill.toml")
+
+    raw_path = Path(argv[1]).expanduser()
+    sync_root = raw_path if raw_path.is_absolute() else (Path.cwd() / raw_path)
+    sync_root = sync_root.resolve(strict=False)
+
+    if not sync_root.exists():
+        raise ValueError(f"Target path does not exist: {sync_root}")
+    if not sync_root.is_dir():
+        raise ValueError(f"Target path is not a directory: {sync_root}")
+
+    return RuntimeContext(mode="local", sync_root=sync_root, config_path=sync_root / ".mskill.toml")
 
 
 def status_cell(result: SkillLinkResult) -> str:
@@ -398,8 +425,10 @@ def main() -> int:
     if RICH_IMPORT_ERROR is not None:
         return bootstrap_fail("Missing dependency 'rich'. Run 'python install.py' or 'python -m pip install rich'.")
 
-    if len(sys.argv) != 1:
-        return fail("This script does not accept command-line arguments.")
+    try:
+        runtime = resolve_runtime_context(sys.argv)
+    except ValueError as exc:
+        return fail(str(exc))
 
     skill_home_raw = os.environ.get("SKILL_HOME")
     if not skill_home_raw:
@@ -409,24 +438,27 @@ def main() -> int:
     if not skill_home.is_dir():
         return fail(f"SKILL_HOME does not point to a directory: {skill_home}")
 
-    home = Path.home()
-    config_path = home / ".mskill.toml"
+    if runtime.mode == "local" and not runtime.config_path.is_file():
+        warn(f"Config file not found under target path. Skipping: {runtime.config_path}")
+        return 0
 
     try:
-        config = load_config(config_path)
+        config = load_config(runtime.config_path)
     except ValueError as exc:
         return fail(str(exc))
 
     if not config:
-        warn(f"No agent sections found in {config_path}. Nothing to do.")
+        warn(f"No agent sections found in {runtime.config_path}. Nothing to do.")
         return 0
 
     info(f"Using SKILL_HOME={skill_home}")
-    info(f"Using config={config_path}")
+    info(f"Using mode={runtime.mode}")
+    info(f"Using sync_root={runtime.sync_root}")
+    info(f"Using config={runtime.config_path}")
 
     stats_list: list[SyncStats] = []
     for agent, skills in config.items():
-        stats_list.append(sync_agent_skills(agent, skills, skill_home, home))
+        stats_list.append(sync_agent_skills(agent, skills, skill_home, runtime.sync_root))
 
     print_summary_table(stats_list)
 
