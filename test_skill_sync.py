@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 import unittest
 import uuid
@@ -66,15 +67,20 @@ class SkillSyncMainTests(unittest.TestCase):
             '[codex]\nskills = ["foo"]\n[claude]\nskills = ["bar"]\n[agents]\nskills = []\n',
         )
 
-        exit_code = self.run_main(["skill-sync.py", str(project_root)], home_root)
+        def fake_create_link(source: Path, target: Path) -> str:
+            target.mkdir()
+            return "symlink"
+
+        with patch.object(SKILL_SYNC, "create_directory_link", side_effect=fake_create_link) as link_mock:
+            exit_code = self.run_main(["skill-sync.py", str(project_root)], home_root)
 
         codex_target = project_root / ".codex" / "skills" / "foo"
         claude_target = project_root / ".claude" / "skills" / "bar"
         self.assertEqual(exit_code, 0)
         self.assertTrue(codex_target.exists())
         self.assertTrue(claude_target.exists())
-        self.assertTrue(codex_target.samefile(foo_skill))
-        self.assertTrue(claude_target.samefile(bar_skill))
+        link_mock.assert_any_call(foo_skill, codex_target)
+        link_mock.assert_any_call(bar_skill, claude_target)
         self.assertFalse((home_root / ".codex").exists())
         self.assertFalse((home_root / ".claude").exists())
 
@@ -86,12 +92,17 @@ class SkillSyncMainTests(unittest.TestCase):
         foo_skill.mkdir()
         self.write_config(home_root, '[codex]\nskills = ["foo"]\n')
 
-        exit_code = self.run_main(["skill-sync.py"], home_root)
+        def fake_create_link(source: Path, target: Path) -> str:
+            target.mkdir()
+            return "symlink"
+
+        with patch.object(SKILL_SYNC, "create_directory_link", side_effect=fake_create_link) as link_mock:
+            exit_code = self.run_main(["skill-sync.py"], home_root)
 
         codex_target = home_root / ".codex" / "skills" / "foo"
         self.assertEqual(exit_code, 0)
         self.assertTrue(codex_target.exists())
-        self.assertTrue(codex_target.samefile(foo_skill))
+        link_mock.assert_called_once_with(foo_skill, codex_target)
 
     def test_local_mode_rejects_missing_target_path(self) -> None:
         home_root = self.root / "home"
@@ -103,22 +114,22 @@ class SkillSyncMainTests(unittest.TestCase):
 
 
 class CreateDirectoryLinkTests(unittest.TestCase):
-    def test_windows_prefers_junction_before_symlink(self) -> None:
+    def test_windows_prefers_mklink_directory_symlink_before_python_symlink(self) -> None:
         source = Path(r"C:\skills\foo")
         target = Path(r"C:\project\.codex\skills\foo")
 
         with (
             patch.object(SKILL_SYNC, "is_windows", return_value=True),
-            patch.object(SKILL_SYNC, "create_windows_junction") as junction_mock,
+            patch.object(SKILL_SYNC, "create_windows_directory_symlink") as windows_symlink_mock,
             patch.object(SKILL_SYNC, "create_directory_symlink") as symlink_mock,
         ):
             link_type = SKILL_SYNC.create_directory_link(source, target)
 
-        self.assertEqual(link_type, "junction")
-        junction_mock.assert_called_once_with(source, target)
+        self.assertEqual(link_type, "symlink")
+        windows_symlink_mock.assert_called_once_with(source, target)
         symlink_mock.assert_not_called()
 
-    def test_windows_falls_back_to_symlink_when_junction_fails(self) -> None:
+    def test_windows_falls_back_to_python_symlink_when_mklink_d_fails(self) -> None:
         source = Path(r"C:\skills\foo")
         target = Path(r"C:\project\.codex\skills\foo")
 
@@ -126,16 +137,34 @@ class CreateDirectoryLinkTests(unittest.TestCase):
             patch.object(SKILL_SYNC, "is_windows", return_value=True),
             patch.object(
                 SKILL_SYNC,
-                "create_windows_junction",
-                side_effect=OSError("junction failed"),
-            ) as junction_mock,
+                "create_windows_directory_symlink",
+                side_effect=OSError("mklink /D failed"),
+            ) as windows_symlink_mock,
             patch.object(SKILL_SYNC, "create_directory_symlink") as symlink_mock,
         ):
             link_type = SKILL_SYNC.create_directory_link(source, target)
 
         self.assertEqual(link_type, "symlink")
-        junction_mock.assert_called_once_with(source, target)
+        windows_symlink_mock.assert_called_once_with(source, target)
         symlink_mock.assert_called_once_with(source, target)
+
+    def test_create_windows_directory_symlink_uses_mklink_d(self) -> None:
+        source = Path(r"C:\skills\foo")
+        target = Path(r"C:\project\.codex\skills\foo")
+
+        completed = subprocess.CompletedProcess(
+            args=["cmd", "/c", "mklink", "/D", str(target), str(source)],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with patch.object(SKILL_SYNC.subprocess, "run", return_value=completed) as run_mock:
+            SKILL_SYNC.create_windows_directory_symlink(source, target)
+
+        run_mock.assert_called_once()
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command, ["cmd", "/c", "mklink", "/D", str(target), str(source)])
 
 
 if __name__ == "__main__":

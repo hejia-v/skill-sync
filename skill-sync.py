@@ -202,10 +202,10 @@ def remove_existing_link(path: Path) -> None:
     path.unlink()
 
 
-def create_windows_junction(source: Path, target: Path) -> None:
+def create_windows_directory_symlink(source: Path, target: Path) -> None:
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     result = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(target), str(source)],
+        ["cmd", "/c", "mklink", "/D", str(target), str(source)],
         capture_output=True,
         text=True,
         creationflags=creation_flags,
@@ -215,7 +215,7 @@ def create_windows_junction(source: Path, target: Path) -> None:
         stderr = result.stderr.strip()
         stdout = result.stdout.strip()
         detail = stderr or stdout or "unknown error"
-        raise OSError(f"Failed to create junction: {detail}")
+        raise OSError(f"Failed to create directory symlink: {detail}")
 
 
 def create_directory_symlink(source: Path, target: Path) -> None:
@@ -228,16 +228,17 @@ def create_directory_symlink(source: Path, target: Path) -> None:
 def create_directory_link(source: Path, target: Path) -> str:
     if is_windows():
         try:
-            create_windows_junction(source, target)
-            return "junction"
-        except OSError as fallback_exc:
+            create_windows_directory_symlink(source, target)
+            return "symlink"
+        except OSError as windows_symlink_exc:
             try:
                 create_directory_symlink(source, target)
                 return "symlink"
             except OSError as exc:
                 raise OSError(
-                    f"Failed to create junction ({fallback_exc}); fallback symlink also failed ({exc})"
-                ) from fallback_exc
+                    "Failed to create directory symlink via mklink /D "
+                    f"({windows_symlink_exc}); fallback symlink also failed ({exc})"
+                ) from windows_symlink_exc
 
     create_directory_symlink(source, target)
     return "symlink"
