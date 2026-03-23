@@ -40,6 +40,13 @@ class SkillSyncMainTests(unittest.TestCase):
     def write_config(self, root: Path, content: str) -> None:
         (root / ".mskill.toml").write_text(content, encoding="utf-8")
 
+    def create_skill(self, name: str, inject_content: str | None = None) -> Path:
+        skill_dir = self.skill_home / name
+        skill_dir.mkdir()
+        if inject_content is not None:
+            (skill_dir / "agent-inject.md").write_text(inject_content, encoding="utf-8")
+        return skill_dir
+
     def test_local_mode_skips_when_config_missing(self) -> None:
         project_root = self.root / "project"
         home_root = self.root / "home"
@@ -55,13 +62,11 @@ class SkillSyncMainTests(unittest.TestCase):
     def test_local_mode_writes_links_under_target_path(self) -> None:
         project_root = self.root / "project"
         home_root = self.root / "home"
-        foo_skill = self.skill_home / "foo"
-        bar_skill = self.skill_home / "bar"
+        foo_skill = self.create_skill("foo")
+        bar_skill = self.create_skill("bar")
 
         project_root.mkdir()
         home_root.mkdir()
-        foo_skill.mkdir()
-        bar_skill.mkdir()
         self.write_config(
             project_root,
             '[codex]\nskills = ["foo"]\n[claude]\nskills = ["bar"]\n[agents]\nskills = []\n',
@@ -86,10 +91,9 @@ class SkillSyncMainTests(unittest.TestCase):
 
     def test_global_mode_still_uses_home_root(self) -> None:
         home_root = self.root / "home"
-        foo_skill = self.skill_home / "foo"
+        foo_skill = self.create_skill("foo")
 
         home_root.mkdir()
-        foo_skill.mkdir()
         self.write_config(home_root, '[codex]\nskills = ["foo"]\n')
 
         def fake_create_link(source: Path, target: Path) -> str:
@@ -111,6 +115,163 @@ class SkillSyncMainTests(unittest.TestCase):
         exit_code = self.run_main(["skill-sync.py", str(self.root / "missing")], home_root)
 
         self.assertEqual(exit_code, 1)
+
+    def test_local_mode_injects_linked_skills_into_agents_and_claude_docs(self) -> None:
+        project_root = self.root / "project"
+        home_root = self.root / "home"
+        foo_skill = self.create_skill("foo", "foo guidance\n")
+        bar_skill = self.create_skill("bar", "bar guidance\nsecond line\n")
+
+        project_root.mkdir()
+        home_root.mkdir()
+        self.write_config(project_root, '[codex]\nskills = ["foo"]\n[claude]\nskills = ["bar"]\n')
+
+        def fake_create_link(source: Path, target: Path) -> str:
+            target.mkdir()
+            return "symlink"
+
+        with patch.object(SKILL_SYNC, "create_directory_link", side_effect=fake_create_link) as link_mock:
+            exit_code = self.run_main(["skill-sync.py", str(project_root)], home_root)
+
+        expected_doc = (
+            "<!-- foo:start -->\n"
+            "foo guidance\n"
+            "<!-- foo:end -->\n"
+            "\n"
+            "<!-- bar:start -->\n"
+            "bar guidance\n"
+            "second line\n"
+            "<!-- bar:end -->\n"
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual((project_root / "AGENTS.md").read_text(encoding="utf-8"), expected_doc)
+        self.assertEqual((project_root / "CLAUDE.md").read_text(encoding="utf-8"), expected_doc)
+        link_mock.assert_any_call(foo_skill, project_root / ".codex" / "skills" / "foo")
+        link_mock.assert_any_call(bar_skill, project_root / ".claude" / "skills" / "bar")
+
+    def test_local_mode_updates_non_reserved_blocks_and_preserves_reserved_blocks(self) -> None:
+        project_root = self.root / "project"
+        home_root = self.root / "home"
+        foo_skill = self.create_skill("foo", "updated foo\n")
+        gitnexus_skill = self.create_skill("gitnexus", "should not replace\n")
+
+        project_root.mkdir()
+        home_root.mkdir()
+        self.write_config(
+            project_root,
+            'reserved_inject_blocks = ["gitnexus"]\n[codex]\nskills = ["gitnexus", "foo"]\n',
+        )
+
+        original_doc = (
+            "# Header\n"
+            "\n"
+            "<!-- gitnexus:start -->\n"
+            "keep me\n"
+            "<!-- gitnexus:end -->\n"
+            "\n"
+            "<!-- foo:start -->\n"
+            "outdated foo\n"
+            "<!-- foo:end -->\n"
+            "\n"
+            "<!-- stale:start -->\n"
+            "remove me\n"
+            "<!-- stale:end -->\n"
+        )
+        (project_root / "AGENTS.md").write_text(original_doc, encoding="utf-8")
+        (project_root / "CLAUDE.md").write_text(original_doc, encoding="utf-8")
+
+        def fake_create_link(source: Path, target: Path) -> str:
+            target.mkdir()
+            return "symlink"
+
+        with patch.object(SKILL_SYNC, "create_directory_link", side_effect=fake_create_link) as link_mock:
+            exit_code = self.run_main(["skill-sync.py", str(project_root)], home_root)
+
+        expected_doc = (
+            "# Header\n"
+            "\n"
+            "<!-- gitnexus:start -->\n"
+            "keep me\n"
+            "<!-- gitnexus:end -->\n"
+            "\n"
+            "<!-- foo:start -->\n"
+            "updated foo\n"
+            "<!-- foo:end -->\n"
+        )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual((project_root / "AGENTS.md").read_text(encoding="utf-8"), expected_doc)
+        self.assertEqual((project_root / "CLAUDE.md").read_text(encoding="utf-8"), expected_doc)
+        link_mock.assert_any_call(gitnexus_skill, project_root / ".codex" / "skills" / "gitnexus")
+        link_mock.assert_any_call(foo_skill, project_root / ".codex" / "skills" / "foo")
+
+    def test_global_mode_does_not_write_agent_docs(self) -> None:
+        home_root = self.root / "home"
+        self.create_skill("foo", "foo guidance\n")
+
+        home_root.mkdir()
+        self.write_config(home_root, '[codex]\nskills = ["foo"]\n')
+
+        def fake_create_link(source: Path, target: Path) -> str:
+            target.mkdir()
+            return "symlink"
+
+        with patch.object(SKILL_SYNC, "create_directory_link", side_effect=fake_create_link):
+            exit_code = self.run_main(["skill-sync.py"], home_root)
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse((home_root / "AGENTS.md").exists())
+        self.assertFalse((home_root / "CLAUDE.md").exists())
+
+    def test_local_mode_fails_when_existing_document_has_malformed_block(self) -> None:
+        project_root = self.root / "project"
+        home_root = self.root / "home"
+        self.create_skill("foo", "foo guidance\n")
+
+        project_root.mkdir()
+        home_root.mkdir()
+        self.write_config(project_root, '[codex]\nskills = ["foo"]\n')
+        (project_root / "AGENTS.md").write_text("<!-- foo:start -->\nmissing end\n", encoding="utf-8")
+
+        def fake_create_link(source: Path, target: Path) -> str:
+            target.mkdir()
+            return "symlink"
+
+        with patch.object(SKILL_SYNC, "create_directory_link", side_effect=fake_create_link):
+            exit_code = self.run_main(["skill-sync.py", str(project_root)], home_root)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual((project_root / "AGENTS.md").read_text(encoding="utf-8"), "<!-- foo:start -->\nmissing end\n")
+        self.assertTrue((project_root / "CLAUDE.md").exists())
+
+
+class LoadConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(__file__).parent / f"test-artifacts-{uuid.uuid4().hex}"
+        self.root.mkdir()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_load_config_parses_reserved_inject_blocks(self) -> None:
+        config_path = self.root / ".mskill.toml"
+        config_path.write_text(
+            'reserved_inject_blocks = ["gitnexus", "gitnexus", ""]\n[codex]\nskills = ["foo"]\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "reserved_inject_blocks contains an empty string."):
+            SKILL_SYNC.load_config(config_path)
+
+        config_path.write_text(
+            'reserved_inject_blocks = ["gitnexus", "gitnexus"]\n[codex]\nskills = ["foo", "foo"]\n',
+            encoding="utf-8",
+        )
+        config = SKILL_SYNC.load_config(config_path)
+
+        self.assertEqual(config.reserved_inject_blocks, ["gitnexus"])
+        self.assertEqual(config.agents, {"codex": ["foo"]})
 
 
 class CreateDirectoryLinkTests(unittest.TestCase):

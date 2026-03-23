@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,11 @@ HEADER_STYLE = "bold white on dark_blue"
 STATUS_OK_STYLE = "bold black on bright_green"
 STATUS_ERROR_STYLE = "bold white on dark_red"
 STATUS_SKIP_STYLE = "bold black on bright_yellow"
+
+RESERVED_INJECT_BLOCKS_KEY = "reserved_inject_blocks"
+AGENT_INJECT_FILENAME = "agent-inject.md"
+INJECT_TARGET_FILES = ("AGENTS.md", "CLAUDE.md")
+MARKER_PATTERN = re.compile(r"^<!--\s*(.+?):(start|end)\s*-->$")
 
 
 def console_width() -> int:
@@ -135,7 +141,51 @@ class RuntimeContext:
     config_path: Path
 
 
-def load_config(config_path: Path) -> dict[str, list[str]]:
+@dataclass
+class SyncConfig:
+    agents: dict[str, list[str]]
+    reserved_inject_blocks: list[str]
+
+
+@dataclass
+class InjectedSkill:
+    name: str
+    content: str
+
+
+@dataclass
+class DocumentBlock:
+    name: str
+    body_lines: list[str]
+    raw_lines: list[str]
+
+
+@dataclass
+class DocumentSegment:
+    kind: str
+    lines: list[str]
+    block: DocumentBlock | None = None
+
+
+def normalize_string_list(values: object, field_name: str) -> list[str]:
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        raise ValueError(f"{field_name} must be an array of strings.")
+
+    ordered_unique_values: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = value.strip()
+        if not name:
+            raise ValueError(f"{field_name} contains an empty string.")
+        if name in seen:
+            continue
+        seen.add(name)
+        ordered_unique_values.append(name)
+
+    return ordered_unique_values
+
+
+def load_config(config_path: Path) -> SyncConfig:
     if not config_path.is_file():
         raise ValueError(f"Config file not found: {config_path}")
 
@@ -148,8 +198,15 @@ def load_config(config_path: Path) -> dict[str, list[str]]:
     if not isinstance(raw_config, dict):
         raise ValueError("Config root must be a TOML table.")
 
-    parsed: dict[str, list[str]] = {}
+    raw_reserved_blocks = raw_config.get(RESERVED_INJECT_BLOCKS_KEY, [])
+    if raw_reserved_blocks is None:
+        raw_reserved_blocks = []
+    reserved_inject_blocks = normalize_string_list(raw_reserved_blocks, RESERVED_INJECT_BLOCKS_KEY)
+
+    parsed_agents: dict[str, list[str]] = {}
     for agent, section in raw_config.items():
+        if agent == RESERVED_INJECT_BLOCKS_KEY:
+            continue
         if not isinstance(agent, str) or not agent.strip():
             raise ValueError("Agent name must be a non-empty string.")
         if not isinstance(section, dict):
@@ -158,23 +215,9 @@ def load_config(config_path: Path) -> dict[str, list[str]]:
         skills = section.get("skills")
         if skills is None:
             raise ValueError(f"Section [{agent}] is missing 'skills'.")
-        if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
-            raise ValueError(f"Section [{agent}].skills must be an array of strings.")
+        parsed_agents[agent.strip()] = normalize_string_list(skills, f"Section [{agent}].skills")
 
-        ordered_unique_skills: list[str] = []
-        seen: set[str] = set()
-        for skill in skills:
-            name = skill.strip()
-            if not name:
-                raise ValueError(f"Section [{agent}] contains an empty skill name.")
-            if name in seen:
-                continue
-            seen.add(name)
-            ordered_unique_skills.append(name)
-
-        parsed[agent.strip()] = ordered_unique_skills
-
-    return parsed
+    return SyncConfig(agents=parsed_agents, reserved_inject_blocks=reserved_inject_blocks)
 
 
 def is_windows() -> bool:
@@ -242,8 +285,6 @@ def create_directory_link(source: Path, target: Path) -> str:
 
     create_directory_symlink(source, target)
     return "symlink"
-
-
 
 def ensure_directory(path: Path) -> None:
     if path.exists():
@@ -351,6 +392,168 @@ def sync_agent_skills(agent: str, skills: list[str], skill_home: Path, sync_root
     return stats
 
 
+def collect_injected_skills(stats_list: list[SyncStats]) -> list[InjectedSkill]:
+    injected_skills: list[InjectedSkill] = []
+    seen: set[str] = set()
+
+    for stats in stats_list:
+        for result in stats.results:
+            if result.status != "OK":
+                continue
+            if result.skill in seen:
+                continue
+
+            inject_path = result.source / AGENT_INJECT_FILENAME
+            if not inject_path.is_file():
+                continue
+
+            content = inject_path.read_text(encoding="utf-8")
+            injected_skills.append(InjectedSkill(name=result.skill, content=content))
+            seen.add(result.skill)
+
+    return injected_skills
+
+
+def detect_newline(content: str) -> str:
+    if "\r\n" in content:
+        return "\r\n"
+    if "\r" in content:
+        return "\r"
+    return "\n"
+
+
+def parse_document_segments(content: str, path: Path) -> list[DocumentSegment]:
+    lines = content.splitlines()
+    segments: list[DocumentSegment] = []
+    text_lines: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        marker_match = MARKER_PATTERN.match(line)
+        if marker_match is None:
+            text_lines.append(line)
+            index += 1
+            continue
+
+        marker_name = marker_match.group(1).strip()
+        marker_kind = marker_match.group(2)
+        if marker_kind == "end":
+            raise ValueError(f"Unmatched end marker for '{marker_name}' in {path}")
+
+        if text_lines:
+            segments.append(DocumentSegment(kind="text", lines=text_lines.copy()))
+            text_lines.clear()
+
+        block_lines = [line]
+        body_lines: list[str] = []
+        index += 1
+
+        while index < len(lines):
+            current_line = lines[index]
+            current_match = MARKER_PATTERN.match(current_line)
+            if current_match is None:
+                body_lines.append(current_line)
+                block_lines.append(current_line)
+                index += 1
+                continue
+
+            current_name = current_match.group(1).strip()
+            current_kind = current_match.group(2)
+            if current_kind == "start":
+                raise ValueError(f"Nested start marker for '{current_name}' in {path}")
+            if current_name != marker_name:
+                raise ValueError(
+                    f"Mismatched end marker for '{current_name}' while parsing '{marker_name}' in {path}"
+                )
+
+            block_lines.append(current_line)
+            segments.append(
+                DocumentSegment(
+                    kind="block",
+                    lines=block_lines,
+                    block=DocumentBlock(name=marker_name, body_lines=body_lines, raw_lines=block_lines.copy()),
+                )
+            )
+            index += 1
+            break
+        else:
+            raise ValueError(f"Missing end marker for '{marker_name}' in {path}")
+
+    if text_lines:
+        segments.append(DocumentSegment(kind="text", lines=text_lines.copy()))
+
+    return segments
+
+
+def block_lines(name: str, content: str) -> list[str]:
+    lines = content.splitlines()
+    return [f"<!-- {name}:start -->", *lines, f"<!-- {name}:end -->"]
+
+
+def render_document_content(
+    existing_content: str,
+    desired_blocks: list[InjectedSkill],
+    reserved_names: set[str],
+    path: Path,
+) -> str:
+    newline = detect_newline(existing_content)
+    desired_by_name = {block.name: block for block in desired_blocks if block.name not in reserved_names}
+    emitted: set[str] = set()
+    output_lines: list[str] = []
+
+    for segment in parse_document_segments(existing_content, path):
+        if segment.kind == "text":
+            output_lines.extend(segment.lines)
+            continue
+
+        assert segment.block is not None
+        if segment.block.name in reserved_names:
+            output_lines.extend(segment.block.raw_lines)
+            continue
+
+        replacement = desired_by_name.get(segment.block.name)
+        if replacement is None:
+            continue
+
+        output_lines.extend(block_lines(replacement.name, replacement.content))
+        emitted.add(replacement.name)
+
+    pending_blocks = [block for block in desired_blocks if block.name not in reserved_names and block.name not in emitted]
+    for pending in pending_blocks:
+        if output_lines and output_lines[-1] != "":
+            output_lines.append("")
+        output_lines.extend(block_lines(pending.name, pending.content))
+        emitted.add(pending.name)
+
+    while output_lines and output_lines[-1] == "":
+        output_lines.pop()
+
+    if not output_lines:
+        return ""
+    return newline.join(output_lines) + newline
+
+
+def sync_document_injections(sync_root: Path, injected_skills: list[InjectedSkill], reserved_names: set[str]) -> int:
+    errors = 0
+
+    for filename in INJECT_TARGET_FILES:
+        target_path = sync_root / filename
+        existing_content = target_path.read_text(encoding="utf-8") if target_path.is_file() else ""
+
+        try:
+            new_content = render_document_content(existing_content, injected_skills, reserved_names, target_path)
+            target_path.write_text(new_content, encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            error(f"[inject] failed to sync {target_path}: {exc}")
+            errors += 1
+            continue
+
+        success(f"[inject] synced {target_path}")
+
+    return errors
+
+
 def resolve_runtime_context(argv: list[str]) -> RuntimeContext:
     if len(argv) > 2:
         raise ValueError("Usage: skill-sync.py [PATH]")
@@ -456,7 +659,7 @@ def main() -> int:
     except ValueError as exc:
         return fail(str(exc))
 
-    if not config:
+    if not config.agents:
         warn(f"No agent sections found in {runtime.config_path}. Nothing to do.")
         return 0
 
@@ -464,14 +667,25 @@ def main() -> int:
     info(f"Using mode={runtime.mode}")
     info(f"Using sync_root={runtime.sync_root}")
     info(f"Using config={runtime.config_path}")
+    if config.reserved_inject_blocks:
+        info(f"Using reserved_inject_blocks={config.reserved_inject_blocks}")
 
     stats_list: list[SyncStats] = []
-    for agent, skills in config.items():
+    for agent, skills in config.agents.items():
         stats_list.append(sync_agent_skills(agent, skills, skill_home, runtime.sync_root))
+
+    injection_errors = 0
+    if runtime.mode == "local":
+        injected_skills = collect_injected_skills(stats_list)
+        injection_errors = sync_document_injections(
+            runtime.sync_root,
+            injected_skills,
+            set(config.reserved_inject_blocks),
+        )
 
     print_summary_table(stats_list)
 
-    had_errors = any(stats.errors for stats in stats_list)
+    had_errors = any(stats.errors for stats in stats_list) or injection_errors > 0
     if had_errors:
         error("Finished with errors.")
         return 1
