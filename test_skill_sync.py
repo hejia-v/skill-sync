@@ -198,6 +198,10 @@ class SkillSyncMainTests(unittest.TestCase):
             "<!-- foo:start -->\n"
             "updated foo\n"
             "<!-- foo:end -->\n"
+            "\n"
+            "<!-- stale:start -->\n"
+            "remove me\n"
+            "<!-- stale:end -->\n"
         )
 
         self.assertEqual(exit_code, 0)

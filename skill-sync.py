@@ -514,6 +514,7 @@ def render_document_content(
 
         replacement = desired_by_name.get(segment.block.name)
         if replacement is None:
+            output_lines.extend(segment.block.raw_lines)
             continue
 
         output_lines.extend(block_lines(replacement.name, replacement.content))
